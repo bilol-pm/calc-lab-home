@@ -20,6 +20,8 @@ typedef enum {
     T_MINUS,   // -
     T_STAR,    // *
     T_SLASH,   // /
+    T_LPAREN,  // (
+    T_RPAREN,  // )
     T_EOL,     // end of the line: a '\n' or the end of the file
     T_BAD      // any other character
 } TokenType;
@@ -44,7 +46,6 @@ static void fail(Parser *p, size_t index) {
 }
 
 // Looks at the next token. It does NOT move: p->pos stays the same.
-// Looks at the next token. It does NOT move: p->pos stays the same.
 static Token peek(const Parser *p) {
     const char *s = p->text;
     size_t len = p->len;
@@ -63,6 +64,10 @@ static Token peek(const Parser *p) {
         t.type = T_STAR;
     } else if (s[i] == '/') {
         t.type = T_SLASH;
+    } else if (s[i] == '(') {
+        t.type = T_LPAREN;
+    } else if (s[i] == ')') {
+        t.type = T_RPAREN;
     } else if (s[i] >= '0' && s[i] <= '9') {
         size_t j = i;
         while (j < len && s[j] >= '0' && s[j] <= '9') j++;
@@ -134,20 +139,48 @@ static long long number_value(const Parser *p, Token t) {
     return n;
 }
 
-// primary reads one number. Anything else cannot start a number, so it is
-// an error at the start of that token. This one fail() gives all these errors:
+// primary and expr call each other (primary -> expr -> term -> primary), so
+// the compiler must know that expr exists before primary uses it.
+static long long expr(Parser *p);
+
+// primary := NUMBER | '(' expr ')'
+// Anything else cannot start a number, so it is an error at the start of that
+// token. This one fail() gives all these errors:
 //   a bad character ("2 + & 5")  -> at that character
 //   two operators ("7 + * 3")    -> at the second operator
 //   "-5" (no unary minus)        -> at the '-'
 //   missing operand ("3 +")      -> at the '\n' or the end of the file
+//   empty parentheses ("2 * ()") -> at the ')'
 static long long primary(Parser *p) {
     Token t = peek(p);
-    if (t.type != T_INT) {
-        fail(p, t.start);
-        return 0;
+
+    if (t.type == T_INT) {
+        p->pos = t.end;
+        return number_value(p, t);
     }
-    p->pos = t.end;
-    return number_value(p, t);
+
+    if (t.type == T_LPAREN) {
+        p->pos = t.end;
+        // Inside the parentheses there is a whole new expression. Calling expr
+        // again (recursion) starts the + - level from the beginning, so
+        // "(1 + 2) * 3" is 9: the parentheses are calculated first.
+        long long value = expr(p);
+        if (p->err) return value;
+
+        Token close = peek(p);
+        if (close.type != T_RPAREN) {
+            // A missing ')' at the end of the line: close is the end-of-line
+            // token, so the error is at the '\n' (or at the end of the file),
+            // as the rules say.
+            fail(p, close.start);
+            return value;
+        }
+        p->pos = close.end;
+        return value;
+    }
+
+    fail(p, t.start);
+    return 0;
 }
 
 // term := primary { ('*' | '/') primary }
