@@ -18,6 +18,8 @@ typedef enum {
     T_INT,     // a number like 25
     T_PLUS,    // +
     T_MINUS,   // -
+    T_STAR,    // *
+    T_SLASH,   // /
     T_EOL,     // end of the line: a '\n' or the end of the file
     T_BAD      // any other character
 } TokenType;
@@ -42,6 +44,7 @@ static void fail(Parser *p, size_t index) {
 }
 
 // Looks at the next token. It does NOT move: p->pos stays the same.
+// Looks at the next token. It does NOT move: p->pos stays the same.
 static Token peek(const Parser *p) {
     const char *s = p->text;
     size_t len = p->len;
@@ -56,6 +59,10 @@ static Token peek(const Parser *p) {
         t.type = T_PLUS;
     } else if (s[i] == '-') {
         t.type = T_MINUS;
+    } else if (s[i] == '*') {
+        t.type = T_STAR;
+    } else if (s[i] == '/') {
+        t.type = T_SLASH;
     } else if (s[i] >= '0' && s[i] <= '9') {
         size_t j = i;
         while (j < len && s[j] >= '0' && s[j] <= '9') j++;
@@ -143,16 +150,46 @@ static long long primary(Parser *p) {
     return number_value(p, t);
 }
 
-// expr := primary { ('+' | '-') primary }
-static long long expr(Parser *p) {
+// term := primary { ('*' | '/') primary }
+// term sits BETWEEN expr and primary. This is why * and / are stronger than
+// + and -: in "3 + 2 * 5" the expr loop asks term for its right side, and term
+// takes "2 * 5" completely before expr can add it to 3.
+static long long term(Parser *p) {
     long long value = primary(p);
+    for (;;) {
+        if (p->err) return value;
+        Token op = peek(p);
+        if (op.type != T_STAR && op.type != T_SLASH) return value;
+        p->pos = op.end;
+
+        Token rhs = peek(p);            // the right operand starts here
+        long long right = primary(p);
+        if (p->err) return value;
+
+        if (op.type == T_STAR) {
+            value = value * right;
+        } else {
+            // Division by zero is reported at the START of the right operand
+            // (the zero), because the zero is the thing that is wrong.
+            if (right == 0) {
+                fail(p, rhs.start);
+                return value;
+            }
+            value = value / right;      // C truncates toward zero: 7 / 2 is 3
+        }
+    }
+}
+
+// expr := term { ('+' | '-') term }
+static long long expr(Parser *p) {
+    long long value = term(p);
     for (;;) {
         if (p->err) return value;
         Token op = peek(p);
         if (op.type != T_PLUS && op.type != T_MINUS) return value;
         p->pos = op.end;
 
-        long long right = primary(p);
+        long long right = term(p);
         if (p->err) return value;
 
         if (op.type == T_PLUS) value = value + right;
