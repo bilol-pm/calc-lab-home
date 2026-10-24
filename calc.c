@@ -6,6 +6,42 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+typedef enum {
+    T_INT,     // a number like 25
+    T_PLUS,    // +
+    T_MINUS,   // -
+    T_EOL,     // end of the line: a '\n' or the end of the file
+    T_BAD      // any other character
+} TokenType;
+
+typedef struct {
+    TokenType type;
+    size_t start;   // index of the first character of the token
+    size_t end;     // index just after the last character
+} Token;
+
+// Looks at the next token, starting from index pos. It does NOT move anything.
+static Token peek(const char *text, size_t len, size_t pos) {
+    size_t i = pos;
+    while (i < len && (text[i] == ' ' || text[i] == '\t')) i++;   // skip blanks
+
+    Token t = { T_BAD, i, i + 1 };
+    if (i >= len || text[i] == '\n') {
+        t.type = T_EOL;
+        t.end = i;
+    } else if (text[i] == '+') {
+        t.type = T_PLUS;
+    } else if (text[i] == '-') {
+        t.type = T_MINUS;
+    } else if (text[i] >= '0' && text[i] <= '9') {
+        size_t j = i;
+        while (j < len && text[j] >= '0' && text[j] <= '9') j++;
+        t.type = T_INT;
+        t.end = j;
+    }
+    return t;
+}
+
 // Reads the whole file into one block of memory.
 // AI (Claude): prompt "<I asked how to read a whole file in C step by step, and used the realloc doubling idea.>" - idea: double the buffer with realloc.
 static char *read_file(const char *path, size_t *len_out) {
@@ -42,7 +78,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "calc: cannot read '%s'\n", argv[1]);
         return 1;
     }
-    printf("read %zu bytes:\n%s", len, text);
+        // Temporary: print every token, to see how the tokenizer works.
+    const char *names[] = { "INT", "PLUS", "MINUS", "EOL", "BAD" };
+    size_t pos = 0;
+    for (;;) {
+        Token t = peek(text, len, pos);
+        printf("%-5s start=%zu end=%zu\n", names[t.type], t.start, t.end);
+        if (t.type == T_EOL && t.start >= len) break;   // end of the file
+        if (t.type == T_EOL) pos = t.start + 1;         // skip the '\n'
+        else pos = t.end;                               // go after the token
+    }
     free(text);
     return 0;
 }
