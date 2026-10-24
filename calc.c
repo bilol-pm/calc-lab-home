@@ -24,7 +24,14 @@ typedef struct {
     const char *text;   // the whole file
     size_t len;         // its length
     size_t pos;         // index where we continue reading
+    size_t err;         // 0 = no error yet, otherwise the 1-based position of the first error
 } Parser;
+
+// Remember the position of the FIRST error. The position is index + 1,
+// because the rules count from 1 and the computer counts from 0.
+static void fail(Parser *p, size_t index) {
+    if (p->err == 0) p->err = index + 1;
+}
 
 // Looks at the next token, starting from index pos. It does NOT move anything.
 // Looks at the next token. It does NOT move: p->pos stays the same.
@@ -86,25 +93,66 @@ static long long number_value(const Parser *p, Token t) {
     return n;
 }
 
-// expr := number { ('+' | '-') number }
-// For now we trust that the input is correct. Errors come in the next step.
-static long long expr(Parser *p) {
+// primary reads one number. Anything else cannot start a number, so it is
+// an error at the start of that token. This one fail() gives all these errors:
+//   a bad character ("2 + & 5")  -> at that character
+//   two operators ("7 + * 3")    -> at the second operator
+//   "-5" (no unary minus)        -> at the '-'
+//   missing operand ("3 +")      -> at the '\n' or the end of the file
+static long long primary(Parser *p) {
     Token t = peek(p);
-    long long value = number_value(p, t);
+    if (t.type != T_INT) {
+        fail(p, t.start);
+        return 0;
+    }
     p->pos = t.end;
+    return number_value(p, t);
+}
 
+// expr := primary { ('+' | '-') primary }
+static long long expr(Parser *p) {
+    long long value = primary(p);
     for (;;) {
+        if (p->err) return value;
         Token op = peek(p);
         if (op.type != T_PLUS && op.type != T_MINUS) return value;
         p->pos = op.end;
 
-        Token next = peek(p);
-        long long right = number_value(p, next);
-        p->pos = next.end;
+        long long right = primary(p);
+        if (p->err) return value;
 
         if (op.type == T_PLUS) value = value + right;
         else value = value - right;
     }
+}
+
+// Calculates every line of the file. Returns 0 if all is fine,
+// or the 1-based position of the first error.
+static size_t evaluate(Parser *p) {
+    while (p->pos < p->len) {
+        Token t = peek(p);
+
+        if (t.type == T_EOL) {              // blank line: nothing to calculate
+            p->pos = t.start;
+            if (p->pos < p->len) p->pos++;  // skip the '\n'
+            continue;
+        }
+
+        long long value = expr(p);
+        if (!p->err) {
+            // The expression is finished, so only the end of the line may follow.
+            // Anything else is an error, for example "2 3".
+            Token end = peek(p);
+            if (end.type != T_EOL) fail(p, end.start);
+        }
+        if (p->err) return p->err;
+
+        printf("%lld\n", value);
+
+        p->pos = peek(p).start;             // now at the '\n' or the end of the file
+        if (p->pos < p->len) p->pos++;      // skip the '\n'
+    }
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -119,8 +167,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    Parser p = { text, len, 0 };
-    printf("%lld\n", expr(&p));
+    Parser p = { text, len, 0, 0 };
+    size_t err = evaluate(&p);
+    if (err) printf("ERROR:%zu\n", err);
 
     free(text);
     return 0;
