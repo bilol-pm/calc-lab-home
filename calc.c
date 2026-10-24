@@ -41,7 +41,6 @@ static void fail(Parser *p, size_t index) {
     if (p->err == 0) p->err = index + 1;
 }
 
-// Looks at the next token, starting from index pos. It does NOT move anything.
 // Looks at the next token. It does NOT move: p->pos stays the same.
 static Token peek(const Parser *p) {
     const char *s = p->text;
@@ -95,8 +94,8 @@ static void out_add(Out *o, const char *s, size_t n) {
 
 
 
-// Reads the whole file into one block of memory.
-// AI (Claude): prompt "<I asked how to read a whole file in C step by step, and used the realloc doubling idea.>" - idea: double the buffer with realloc.
+// AI (Claude): I asked how to read a whole file in C step by step.
+// I used the realloc doubling idea: when the buffer is full, make it twice bigger.
 static char *read_file(const char *path, size_t *len_out) {
     FILE *f = fopen(path, "rb");
     if (f == NULL) return NULL;
@@ -162,7 +161,7 @@ static long long expr(Parser *p) {
 }
 
 // Calculates every line of the file and adds each result to out.
-// or the 1-based position of the first error.
+// Returns 0 if all is fine, or the 1-based position of the first error.
 static size_t evaluate(Parser *p, Out *out) {
     while (p->pos < p->len) {
         Token t = peek(p);
