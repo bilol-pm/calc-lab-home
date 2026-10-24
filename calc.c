@@ -20,27 +20,38 @@ typedef struct {
     size_t end;     // index just after the last character
 } Token;
 
+typedef struct {
+    const char *text;   // the whole file
+    size_t len;         // its length
+    size_t pos;         // index where we continue reading
+} Parser;
+
 // Looks at the next token, starting from index pos. It does NOT move anything.
-static Token peek(const char *text, size_t len, size_t pos) {
-    size_t i = pos;
-    while (i < len && (text[i] == ' ' || text[i] == '\t')) i++;   // skip blanks
+// Looks at the next token. It does NOT move: p->pos stays the same.
+static Token peek(const Parser *p) {
+    const char *s = p->text;
+    size_t len = p->len;
+    size_t i = p->pos;
+    while (i < len && (s[i] == ' ' || s[i] == '\t')) i++;   // skip blanks
 
     Token t = { T_BAD, i, i + 1 };
-    if (i >= len || text[i] == '\n') {
+    if (i >= len || s[i] == '\n') {
         t.type = T_EOL;
         t.end = i;
-    } else if (text[i] == '+') {
+    } else if (s[i] == '+') {
         t.type = T_PLUS;
-    } else if (text[i] == '-') {
+    } else if (s[i] == '-') {
         t.type = T_MINUS;
-    } else if (text[i] >= '0' && text[i] <= '9') {
+    } else if (s[i] >= '0' && s[i] <= '9') {
         size_t j = i;
-        while (j < len && text[j] >= '0' && text[j] <= '9') j++;
+        while (j < len && s[j] >= '0' && s[j] <= '9') j++;
         t.type = T_INT;
         t.end = j;
     }
     return t;
 }
+
+
 
 // Reads the whole file into one block of memory.
 // AI (Claude): prompt "<I asked how to read a whole file in C step by step, and used the realloc doubling idea.>" - idea: double the buffer with realloc.
@@ -67,6 +78,35 @@ static char *read_file(const char *path, size_t *len_out) {
     return buf;
 }
 
+// Turns the digits of an INT token into a number: "25" -> 25.
+static long long number_value(const Parser *p, Token t) {
+    long long n = 0;
+    for (size_t k = t.start; k < t.end; k++)
+        n = n * 10 + (p->text[k] - '0');
+    return n;
+}
+
+// expr := number { ('+' | '-') number }
+// For now we trust that the input is correct. Errors come in the next step.
+static long long expr(Parser *p) {
+    Token t = peek(p);
+    long long value = number_value(p, t);
+    p->pos = t.end;
+
+    for (;;) {
+        Token op = peek(p);
+        if (op.type != T_PLUS && op.type != T_MINUS) return value;
+        p->pos = op.end;
+
+        Token next = peek(p);
+        long long right = number_value(p, next);
+        p->pos = next.end;
+
+        if (op.type == T_PLUS) value = value + right;
+        else value = value - right;
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: calc input.txt\n");
@@ -78,16 +118,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "calc: cannot read '%s'\n", argv[1]);
         return 1;
     }
-        // Temporary: print every token, to see how the tokenizer works.
-    const char *names[] = { "INT", "PLUS", "MINUS", "EOL", "BAD" };
-    size_t pos = 0;
-    for (;;) {
-        Token t = peek(text, len, pos);
-        printf("%-5s start=%zu end=%zu\n", names[t.type], t.start, t.end);
-        if (t.type == T_EOL && t.start >= len) break;   // end of the file
-        if (t.type == T_EOL) pos = t.start + 1;         // skip the '\n'
-        else pos = t.end;                               // go after the token
-    }
+
+    Parser p = { text, len, 0 };
+    printf("%lld\n", expr(&p));
+
     free(text);
     return 0;
 }
