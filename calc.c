@@ -5,6 +5,14 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
+
+// These words are part of every output file name.
+#define NAME "biloliddin"
+#define LASTNAME "gulomov"
+#define STUDENT_ID "251ADB096"
 
 typedef enum {
     T_INT,     // a number like 25
@@ -56,6 +64,33 @@ static Token peek(const Parser *p) {
         t.end = j;
     }
     return t;
+}
+
+// Output buffer: we keep all results in memory and write them only at the end.
+// Why: if any line has an error, the output must contain ONLY "ERROR:<pos>".
+typedef struct {
+    char *data;     // the text collected so far
+    size_t len;     // how many characters are in it
+    size_t cap;     // how many characters fit before we must make it bigger
+} Out;
+
+// Adds n characters to the buffer. When the buffer is full we make it twice
+// bigger, so we copy the data only a few times, even for a huge file.
+static void out_add(Out *o, const char *s, size_t n) {
+    if (n == 0) return;
+    if (o->len + n > o->cap) {
+        size_t cap = o->cap ? o->cap : 4096;
+        while (cap < o->len + n) cap *= 2;
+        char *bigger = realloc(o->data, cap);
+        if (bigger == NULL) {
+            fprintf(stderr, "calc: out of memory\n");
+            exit(1);
+        }
+        o->data = bigger;
+        o->cap = cap;
+    }
+    memcpy(o->data + o->len, s, n);
+    o->len += n;
 }
 
 
@@ -126,9 +161,9 @@ static long long expr(Parser *p) {
     }
 }
 
-// Calculates every line of the file. Returns 0 if all is fine,
+// Calculates every line of the file and adds each result to out.
 // or the 1-based position of the first error.
-static size_t evaluate(Parser *p) {
+static size_t evaluate(Parser *p, Out *out) {
     while (p->pos < p->len) {
         Token t = peek(p);
 
@@ -147,7 +182,9 @@ static size_t evaluate(Parser *p) {
         }
         if (p->err) return p->err;
 
-        printf("%lld\n", value);
+        char line[32];
+        int n = snprintf(line, sizeof line, "%lld\n", value);
+        out_add(out, line, (size_t)n);
 
         p->pos = peek(p).start;             // now at the '\n' or the end of the file
         if (p->pos < p->len) p->pos++;      // skip the '\n'
@@ -155,22 +192,90 @@ static size_t evaluate(Parser *p) {
     return 0;
 }
 
-int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: calc input.txt\n");
-        return 1;
+// File name without the folder and without ".txt": "labs/task1.txt" -> "task1".
+// We return a pointer into the same string and its length, so nothing is copied.
+static const char *file_base(const char *path, size_t *n) {
+    const char *slash = strrchr(path, '/');
+    const char *name = slash ? slash + 1 : path;
+    *n = strlen(name);
+    if (*n > 4 && strcmp(name + *n - 4, ".txt") == 0) *n -= 4;
+    return name;
+}
+
+// Builds the path  <OUTDIR>/<base>_<name>_<lastname>_<studentid>.txt
+// The first snprintf only measures how long the text will be, the second one
+// writes it into memory of exactly the right size.
+static char *output_path(const char *outdir, const char *base, size_t base_len) {
+    int n = snprintf(NULL, 0, "%s/%.*s_%s_%s_%s.txt", outdir, (int)base_len, base,
+                     NAME, LASTNAME, STUDENT_ID);
+    char *path = malloc((size_t)n + 1);
+    if (path == NULL) {
+        fprintf(stderr, "calc: out of memory\n");
+        exit(1);
     }
+    snprintf(path, (size_t)n + 1, "%s/%.*s_%s_%s_%s.txt", outdir, (int)base_len, base,
+             NAME, LASTNAME, STUDENT_ID);
+    return path;
+}
+
+// Creates the output folder. If it already exists we just use it.
+static int ensure_dir(const char *path) {
+    if (mkdir(path, 0777) == 0) return 0;
+    int saved = errno;
+    struct stat st;
+    if (saved == EEXIST && stat(path, &st) == 0 && S_ISDIR(st.st_mode)) return 0;
+    fprintf(stderr, "calc: cannot create output folder '%s': %s\n", path,
+            saved == EEXIST ? "exists but is not a folder" : strerror(saved));
+    return 1;
+}
+
+// Calculates one input file and writes the result file into outdir.
+// An ERROR:<pos> result is normal: it returns 0. Only real problems
+// (cannot read the input, cannot write the output) return 1.
+static int process_file(const char *input_path, const char *outdir) {
     size_t len = 0;
-    char *text = read_file(argv[1], &len);
+    char *text = read_file(input_path, &len);
     if (text == NULL) {
-        fprintf(stderr, "calc: cannot read '%s'\n", argv[1]);
+        fprintf(stderr, "calc: cannot read '%s': %s\n", input_path, strerror(errno));
         return 1;
     }
 
     Parser p = { text, len, 0, 0 };
-    size_t err = evaluate(&p);
-    if (err) printf("ERROR:%zu\n", err);
-
+    Out out = { NULL, 0, 0 };
+    size_t err = evaluate(&p, &out);
+    if (err) {
+        // "No partial results": throw away everything and keep only the error.
+        char line[64];
+        int n = snprintf(line, sizeof line, "ERROR:%zu\n", err);
+        out.len = 0;
+        out_add(&out, line, (size_t)n);
+    }
     free(text);
-    return 0;
+
+    int rc = 1;
+    if (ensure_dir(outdir) == 0) {
+        size_t base_len;
+        const char *base = file_base(input_path, &base_len);
+        char *path = output_path(outdir, base, base_len);
+        FILE *f = fopen(path, "wb");
+        if (f == NULL) {
+            fprintf(stderr, "calc: cannot write '%s': %s\n", path, strerror(errno));
+        } else {
+            if (out.len > 0) fwrite(out.data, 1, out.len, f);
+            if (fclose(f) != 0) fprintf(stderr, "calc: error while writing '%s'\n", path);
+            else rc = 0;
+        }
+        free(path);
+    }
+    free(out.data);
+    return rc;
+}
+
+int main(int argc, char **argv) {
+    // For now we understand only:  calc -o OUTDIR input.txt
+    if (argc != 4 || strcmp(argv[1], "-o") != 0) {
+        fprintf(stderr, "usage: calc -o OUTDIR input.txt\n");
+        return 2;
+    }
+    return process_file(argv[3], argv[2]);
 }
