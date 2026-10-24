@@ -20,6 +20,7 @@ typedef enum {
     T_MINUS,   // -
     T_STAR,    // *
     T_SLASH,   // /
+    T_POW,     // **
     T_LPAREN,  // (
     T_RPAREN,  // )
     T_EOL,     // end of the line: a '\n' or the end of the file
@@ -61,7 +62,14 @@ static Token peek(const Parser *p) {
     } else if (s[i] == '-') {
         t.type = T_MINUS;
     } else if (s[i] == '*') {
-        t.type = T_STAR;
+        // Two stars are ONE token. If we read them as two '*' tokens,
+        // "2 ** 3" and "2 * * 3" would look the same.
+        if (i + 1 < len && s[i + 1] == '*') {
+            t.type = T_POW;
+            t.end = i + 2;
+        } else {
+            t.type = T_STAR;
+        }
     } else if (s[i] == '/') {
         t.type = T_SLASH;
     } else if (s[i] == '(') {
@@ -183,12 +191,53 @@ static long long primary(Parser *p) {
     return 0;
 }
 
-// term := primary { ('*' | '/') primary }
-// term sits BETWEEN expr and primary. This is why * and / are stronger than
+// Integer power by repeated squaring: 3 ** 10 needs only about 4 steps, so
+// even a huge exponent is fast. The numbers are unsigned, so a very big result
+// wraps around instead of causing undefined behaviour in C.
+static long long int_power(long long base, long long exponent) {
+    unsigned long long result = 1;
+    unsigned long long b = (unsigned long long)base;
+    unsigned long long e = (unsigned long long)exponent;
+    while (e > 0) {
+        if (e & 1) result *= b;
+        b *= b;
+        e >>= 1;
+    }
+    return (long long)result;
+}
+
+// power := primary [ '**' power ]
+// power calls ITSELF for the exponent, so 2 ** 3 ** 2 groups as 2 ** (3 ** 2),
+// which is 512. That is what "right-associative" means. The loops in term and
+// expr go the other way: they use the left result first, so 8 - 3 - 2 is
+// (8 - 3) - 2. Power is below term, so ** is stronger than * and /.
+static long long power(Parser *p) {
+    long long base = primary(p);
+    if (p->err) return base;
+
+    Token op = peek(p);
+    if (op.type != T_POW) return base;
+    p->pos = op.end;
+
+    Token rhs = peek(p);                // the exponent starts here
+    long long exponent = power(p);
+    if (p->err) return base;
+
+    // An integer cannot have a negative power. The error is at the START of
+    // the exponent, because the exponent is the thing that is wrong.
+    if (exponent < 0) {
+        fail(p, rhs.start);
+        return base;
+    }
+    return int_power(base, exponent);   // x ** 0 is 1, also 0 ** 0
+}
+
+// term := power { ('*' | '/') power }
+// term sits BETWEEN expr and power. This is why * and / are stronger than
 // + and -: in "3 + 2 * 5" the expr loop asks term for its right side, and term
 // takes "2 * 5" completely before expr can add it to 3.
 static long long term(Parser *p) {
-    long long value = primary(p);
+    long long value = power(p);
     for (;;) {
         if (p->err) return value;
         Token op = peek(p);
@@ -196,7 +245,7 @@ static long long term(Parser *p) {
         p->pos = op.end;
 
         Token rhs = peek(p);            // the right operand starts here
-        long long right = primary(p);
+        long long right = power(p);
         if (p->err) return value;
 
         if (op.type == T_STAR) {
@@ -239,6 +288,17 @@ static size_t evaluate(Parser *p, Out *out) {
         if (t.type == T_EOL) {              // blank line: nothing to calculate
             p->pos = t.start;
             if (p->pos < p->len) p->pos++;  // skip the '\n'
+            continue;
+        }
+
+        if (t.type == T_BAD && p->text[t.start] == '#') {
+            // '#' is a comment only if it is the first character on the line
+            // that is not a blank. In the middle of a line the parser sees it
+            // and reports it as an invalid character. We skip the whole
+            // comment with memchr, but p->pos still moves over every
+            // character, so the positions after the comment stay correct.
+            const char *nl = memchr(p->text + t.start, '\n', p->len - t.start);
+            p->pos = nl ? (size_t)(nl - p->text) + 1 : p->len;
             continue;
         }
 
