@@ -5,7 +5,17 @@
 
 #include <stdio.h>
 
-int main(void) {
-    printf("hello\n");
+int main(int argc, char **argv) {
+    if (argc != 2) {
+        fprintf(stderr, "usage: calc input.txt\n");
+        return 1;
+    }
+    FILE *f = fopen(argv[1], "rb");
+    if (f == NULL) {
+        fprintf(stderr, "calc: cannot open '%s'\n", argv[1]);
+        return 1;
+    }
+    printf("file opened\n");
+    fclose(f);
     return 0;
 }
