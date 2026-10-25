@@ -400,11 +400,64 @@ static int process_file(const char *input_path, const char *outdir) {
     return rc;
 }
 
-int main(int argc, char **argv) {
-    // For now we understand only:  calc -o OUTDIR input.txt
-    if (argc != 4 || strcmp(argv[1], "-o") != 0) {
-        fprintf(stderr, "usage: calc -o OUTDIR input.txt\n");
-        return 2;
+// <base>_<name>_<studentid>   (the default output folder when -o is not given)
+static char *default_outdir(const char *base, size_t base_len) {
+    int n = snprintf(NULL, 0, "%.*s_%s_%s", (int)base_len, base, NAME, STUDENT_ID);
+    char *path = malloc((size_t)n + 1);
+    if (path == NULL) {
+        fprintf(stderr, "calc: out of memory\n");
+        exit(1);
     }
-    return process_file(argv[3], argv[2]);
+    snprintf(path, (size_t)n + 1, "%.*s_%s_%s", (int)base_len, base, NAME, STUDENT_ID);
+    return path;
+}
+
+// Prints the usage text to stderr (errors go to stderr, not to stdout).
+// The return value 2 is the exit code for "wrong command line".
+static int usage(const char *message) {
+    if (message != NULL) fprintf(stderr, "calc: %s\n", message);
+    fprintf(stderr, "usage: calc [-d DIR | --dir DIR] [-o OUTDIR | --output-dir OUTDIR] [input.txt]\n");
+    return 2;
+}
+
+int main(int argc, char **argv) {
+    const char *outdir = NULL;
+    const char *input = NULL;
+
+    // Go through the words of the command line one by one. An option that
+    // needs a value (like -o) takes the NEXT word, so we move i one more step.
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (strcmp(a, "-o") == 0 || strcmp(a, "--output-dir") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "calc: missing value after '%s'\n", a);
+                return usage(NULL);
+            }
+            i++;
+            outdir = argv[i];
+        } else if (a[0] == '-' && a[1] != '\0') {
+            fprintf(stderr, "calc: unknown option '%s'\n", a);
+            return usage(NULL);
+        } else if (input != NULL) {
+            fprintf(stderr, "calc: only one input file is allowed, but also got '%s'\n", a);
+            return usage(NULL);
+        } else {
+            input = a;
+        }
+    }
+    if (input == NULL) return usage("no input file given");
+
+    // Without -o the output folder is <input_base>_<name>_<studentid>
+    // in the current folder.
+    char *auto_dir = NULL;
+    if (outdir == NULL) {
+        size_t n;
+        const char *base = file_base(input, &n);
+        auto_dir = default_outdir(base, n);
+        outdir = auto_dir;
+    }
+
+    int rc = process_file(input, outdir);
+    free(auto_dir);
+    return rc;
 }
