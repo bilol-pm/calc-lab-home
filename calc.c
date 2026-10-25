@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <dirent.h>
 #include <sys/stat.h>
 
 // These words are part of every output file name.
@@ -400,6 +401,103 @@ static int process_file(const char *input_path, const char *outdir) {
     return rc;
 }
 
+// Last part of a path, ignoring slashes at the end: "labs/week1/" -> "week1".
+// We return a pointer into the same string and its length, so nothing is copied.
+static const char *last_part(const char *path, size_t *n) {
+    size_t end = strlen(path);
+    while (end > 0 && path[end - 1] == '/') end--;
+    size_t start = end;
+    while (start > 0 && path[start - 1] != '/') start--;
+    *n = end - start;
+    return path + start;
+}
+
+// Makes a new copy of a string. The caller must free it.
+static char *copy_string(const char *s) {
+    size_t n = strlen(s);
+    char *c = malloc(n + 1);
+    if (c == NULL) {
+        fprintf(stderr, "calc: out of memory\n");
+        exit(1);
+    }
+    memcpy(c, s, n + 1);
+    return c;
+}
+
+// "dir" + "name" -> "dir/name" in new memory. The caller must free it.
+static char *join_path(const char *dir, const char *name) {
+    int n = snprintf(NULL, 0, "%s/%s", dir, name);
+    char *path = malloc((size_t)n + 1);
+    if (path == NULL) {
+        fprintf(stderr, "calc: out of memory\n");
+        exit(1);
+    }
+    snprintf(path, (size_t)n + 1, "%s/%s", dir, name);
+    return path;
+}
+
+// Used by qsort to sort file names with strcmp.
+static int compare_names(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+// Calculates every *.txt file directly inside dir. Other files and
+// subfolders are ignored.
+static int process_dir(const char *dir, const char *outdir) {
+    DIR *d = opendir(dir);
+    if (d == NULL) {
+        fprintf(stderr, "calc: cannot open folder '%s': %s\n", dir, strerror(errno));
+        return 1;
+    }
+
+    // First collect the names, then work. Why: if OUTDIR is the same folder as
+    // DIR, the files we write must not be read again as inputs.
+    char **names = NULL;
+    size_t count = 0, cap = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        size_t n = strlen(e->d_name);
+        if (n <= 4 || strcmp(e->d_name + n - 4, ".txt") != 0) continue;
+
+        // A folder can also be called "x.txt", so we ask the system what it is.
+        char *full = join_path(dir, e->d_name);
+        struct stat st;
+        int is_file = stat(full, &st) == 0 && S_ISREG(st.st_mode);
+        free(full);
+        if (!is_file) continue;
+
+        if (count == cap) {
+            cap = cap ? cap * 2 : 16;
+            char **bigger = realloc(names, cap * sizeof *names);
+            if (bigger == NULL) {
+                fprintf(stderr, "calc: out of memory\n");
+                exit(1);
+            }
+            names = bigger;
+        }
+        names[count++] = copy_string(e->d_name);
+    }
+    closedir(d);
+
+    // readdir gives the names in a random order. We sort them, so the program
+    // does the same thing on every run.
+    if (count > 1) qsort(names, count, sizeof *names, compare_names);
+
+    // One bad file must not stop the others, but the exit code must show it.
+    int dir_ok = ensure_dir(outdir) == 0;
+    int rc = dir_ok ? 0 : 1;
+    for (size_t k = 0; k < count; k++) {
+        if (dir_ok) {
+            char *full = join_path(dir, names[k]);
+            if (process_file(full, outdir) != 0) rc = 1;
+            free(full);
+        }
+        free(names[k]);
+    }
+    free(names);
+    return rc;
+}
+
 // <base>_<name>_<studentid>   (the default output folder when -o is not given)
 static char *default_outdir(const char *base, size_t base_len) {
     int n = snprintf(NULL, 0, "%.*s_%s_%s", (int)base_len, base, NAME, STUDENT_ID);
@@ -421,6 +519,7 @@ static int usage(const char *message) {
 }
 
 int main(int argc, char **argv) {
+    const char *dir = NULL;
     const char *outdir = NULL;
     const char *input = NULL;
 
@@ -428,7 +527,14 @@ int main(int argc, char **argv) {
     // needs a value (like -o) takes the NEXT word, so we move i one more step.
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
-        if (strcmp(a, "-o") == 0 || strcmp(a, "--output-dir") == 0) {
+        if (strcmp(a, "-d") == 0 || strcmp(a, "--dir") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "calc: missing value after '%s'\n", a);
+                return usage(NULL);
+            }
+            i++;
+            dir = argv[i];
+        } else if (strcmp(a, "-o") == 0 || strcmp(a, "--output-dir") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "calc: missing value after '%s'\n", a);
                 return usage(NULL);
@@ -445,19 +551,20 @@ int main(int argc, char **argv) {
             input = a;
         }
     }
-    if (input == NULL) return usage("no input file given");
+    if (dir != NULL && input != NULL) return usage("use either -d DIR or an input file, not both");
+    if (dir == NULL && input == NULL) return usage("no input file or folder given");
 
-    // Without -o the output folder is <input_base>_<name>_<studentid>
-    // in the current folder.
+    // Without -o the output folder is <input_base>_<name>_<studentid> in the
+    // current folder. With -d, <input_base> is the name of the folder.
     char *auto_dir = NULL;
     if (outdir == NULL) {
         size_t n;
-        const char *base = file_base(input, &n);
+        const char *base = dir ? last_part(dir, &n) : file_base(input, &n);
         auto_dir = default_outdir(base, n);
         outdir = auto_dir;
     }
 
-    int rc = process_file(input, outdir);
+    int rc = dir ? process_dir(dir, outdir) : process_file(input, outdir);
     free(auto_dir);
     return rc;
 }
