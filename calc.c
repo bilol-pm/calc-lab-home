@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <math.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -16,7 +17,8 @@
 #define STUDENT_ID "251ADB096"
 
 typedef enum {
-    T_INT,     // a number like 25
+    T_INT,     // an integer like 25
+    T_FLOAT,   // a float like 12.5
     T_PLUS,    // +
     T_MINUS,   // -
     T_STAR,    // *
@@ -34,8 +36,16 @@ typedef struct {
     size_t end;     // index just after the last character
 } Token;
 
+// A number is either an integer or a float. We remember which one, because
+// "7 / 2" must give 3 (integer) but "7 / 2.0" must give 3.5 (float).
 typedef struct {
-    const char *text;   // the whole file
+    int is_float;   // 0: the number is in i, 1: the number is in d
+    long long i;
+    double d;
+} Value;
+
+typedef struct {
+    char *text;         // the whole file (we change it for a moment in number_value)
     size_t len;         // its length
     size_t pos;         // index where we continue reading
     size_t err;         // 0 = no error yet, otherwise the 1-based position of the first error
@@ -81,6 +91,15 @@ static Token peek(const Parser *p) {
         size_t j = i;
         while (j < len && s[j] >= '0' && s[j] <= '9') j++;
         t.type = T_INT;
+        // A '.' belongs to the number only if a digit follows it. Otherwise the
+        // number ends before the '.', and the '.' becomes a T_BAD token of its
+        // own. So "5.", ".5" and "1.5e3" give an error exactly at the '.' or
+        // at the 'e', as the rules say.
+        if (j + 1 < len && s[j] == '.' && s[j + 1] >= '0' && s[j + 1] <= '9') {
+            j++;
+            while (j < len && s[j] >= '0' && s[j] <= '9') j++;
+            t.type = T_FLOAT;
+        }
         t.end = j;
     }
     return t;
@@ -113,8 +132,7 @@ static void out_add(Out *o, const char *s, size_t n) {
     o->len += n;
 }
 
-
-
+// Reads the whole file into one block of memory.
 // AI (Claude): I asked how to read a whole file in C step by step.
 // I used the realloc doubling idea: when the buffer is full, make it twice bigger.
 static char *read_file(const char *path, size_t *len_out) {
@@ -140,56 +158,30 @@ static char *read_file(const char *path, size_t *len_out) {
     return buf;
 }
 
-// Turns the digits of an INT token into a number: "25" -> 25.
-static long long number_value(const Parser *p, Token t) {
-    long long n = 0;
-    for (size_t k = t.start; k < t.end; k++)
-        n = n * 10 + (p->text[k] - '0');
-    return n;
+// Turns a number token into a Value.
+static Value number_value(Parser *p, Token t) {
+    Value v = { 0, 0, 0.0 };
+    if (t.type == T_INT) {
+        // Unsigned arithmetic never has undefined behaviour, even for huge input.
+        unsigned long long n = 0;
+        for (size_t k = t.start; k < t.end; k++)
+            n = n * 10 + (unsigned long long)(p->text[k] - '0');
+        v.i = (long long)n;
+        return v;
+    }
+    // strtod would also read things after our digits (like "e3" in "1.5e3"),
+    // so for a moment we cut the text with a '\0' right after the token. We own
+    // this buffer, so changing it and putting the old character back is safe.
+    char saved = p->text[t.end];
+    p->text[t.end] = '\0';
+    v.is_float = 1;
+    v.d = strtod(p->text + t.start, NULL);
+    p->text[t.end] = saved;
+    return v;
 }
 
-// primary and expr call each other (primary -> expr -> term -> primary), so
-// the compiler must know that expr exists before primary uses it.
-static long long expr(Parser *p);
-
-// primary := NUMBER | '(' expr ')'
-// Anything else cannot start a number, so it is an error at the start of that
-// token. This one fail() gives all these errors:
-//   a bad character ("2 + & 5")  -> at that character
-//   two operators ("7 + * 3")    -> at the second operator
-//   "-5" (no unary minus)        -> at the '-'
-//   missing operand ("3 +")      -> at the '\n' or the end of the file
-//   empty parentheses ("2 * ()") -> at the ')'
-static long long primary(Parser *p) {
-    Token t = peek(p);
-
-    if (t.type == T_INT) {
-        p->pos = t.end;
-        return number_value(p, t);
-    }
-
-    if (t.type == T_LPAREN) {
-        p->pos = t.end;
-        // Inside the parentheses there is a whole new expression. Calling expr
-        // again (recursion) starts the + - level from the beginning, so
-        // "(1 + 2) * 3" is 9: the parentheses are calculated first.
-        long long value = expr(p);
-        if (p->err) return value;
-
-        Token close = peek(p);
-        if (close.type != T_RPAREN) {
-            // A missing ')' at the end of the line: close is the end-of-line
-            // token, so the error is at the '\n' (or at the end of the file),
-            // as the rules say.
-            fail(p, close.start);
-            return value;
-        }
-        p->pos = close.end;
-        return value;
-    }
-
-    fail(p, t.start);
-    return 0;
+static double as_double(Value v) {
+    return v.is_float ? v.d : (double)v.i;
 }
 
 // Integer power by repeated squaring: 3 ** 10 needs only about 4 steps, so
@@ -207,13 +199,119 @@ static long long int_power(long long base, long long exponent) {
     return (long long)result;
 }
 
+// Computes "a op b". op_pos is the index of the operator and rhs_pos is the
+// index where the right operand starts. They are only used for errors:
+//   division by zero          -> start of the right operand (the zero is wrong)
+//   negative integer exponent -> start of the exponent (the exponent is wrong)
+//   float result inf or nan   -> the operator (no single operand is wrong)
+static Value apply(Parser *p, TokenType op, Value a, Value b,
+                   size_t op_pos, size_t rhs_pos) {
+    Value r = { 0, 0, 0.0 };
+
+    // Division by zero, for integers and floats. In C, 0.0 == -0.0 is true.
+    if (op == T_SLASH && (b.is_float ? b.d == 0.0 : b.i == 0)) {
+        fail(p, rhs_pos);
+        return r;
+    }
+
+    // Integer or float? If BOTH operands are integers, we stay in integers.
+    // If at least one is a float, the other one is converted to double and the
+    // whole operation is done in double. This is the rule "7 / 2.0 is 3.5".
+    if (!a.is_float && !b.is_float) {
+        unsigned long long x = (unsigned long long)a.i;
+        unsigned long long y = (unsigned long long)b.i;
+        switch (op) {
+            case T_PLUS:  r.i = (long long)(x + y); break;
+            case T_MINUS: r.i = (long long)(x - y); break;
+            case T_STAR:  r.i = (long long)(x * y); break;
+            case T_SLASH:
+                // C truncates toward zero, as the rules want: 7 / 2 is 3.
+                // b == -1 is separate, because the most negative number
+                // divided by -1 would overflow.
+                r.i = (b.i == -1) ? (long long)(0ULL - x) : a.i / b.i;
+                break;
+            case T_POW:
+                if (b.i < 0) {              // an integer cannot have a negative power
+                    fail(p, rhs_pos);
+                    return r;
+                }
+                r.i = int_power(a.i, b.i);  // x ** 0 is 1, also 0 ** 0
+                break;
+            default: break;
+        }
+        return r;
+    }
+
+    double x = as_double(a), y = as_double(b), z = 0.0;
+    switch (op) {
+        case T_PLUS:  z = x + y; break;
+        case T_MINUS: z = x - y; break;
+        case T_STAR:  z = x * y; break;
+        case T_SLASH: z = x / y; break;
+        case T_POW:   z = pow(x, y); break;
+        default: break;
+    }
+    if (!isfinite(z)) {                     // inf or nan, for example 10.0 ** 400
+        fail(p, op_pos);
+        return r;
+    }
+    r.is_float = 1;
+    r.d = z;
+    return r;
+}
+
+// primary and expr call each other (primary -> expr -> term -> primary), so
+// the compiler must know that expr exists before primary uses it.
+static Value expr(Parser *p);
+
+// primary := NUMBER | '(' expr ')'
+// Anything else cannot start a number, so it is an error at the start of that
+// token. This one fail() gives all these errors:
+//   a bad character ("2 + & 5")  -> at that character
+//   two operators ("7 + * 3")    -> at the second operator
+//   "-5" (no unary minus)        -> at the '-'
+//   missing operand ("3 +")      -> at the '\n' or the end of the file
+//   empty parentheses ("2 * ()") -> at the ')'
+static Value primary(Parser *p) {
+    Value v = { 0, 0, 0.0 };
+    Token t = peek(p);
+
+    if (t.type == T_INT || t.type == T_FLOAT) {
+        p->pos = t.end;
+        return number_value(p, t);
+    }
+
+    if (t.type == T_LPAREN) {
+        p->pos = t.end;
+        // Inside the parentheses there is a whole new expression. Calling expr
+        // again (recursion) starts the + - level from the beginning, so
+        // "(1 + 2) * 3" is 9: the parentheses are calculated first.
+        v = expr(p);
+        if (p->err) return v;
+
+        Token close = peek(p);
+        if (close.type != T_RPAREN) {
+            // A missing ')' at the end of the line: close is the end-of-line
+            // token, so the error is at the '\n' (or at the end of the file),
+            // as the rules say.
+            fail(p, close.start);
+            return v;
+        }
+        p->pos = close.end;
+        return v;
+    }
+
+    fail(p, t.start);
+    return v;
+}
+
 // power := primary [ '**' power ]
 // power calls ITSELF for the exponent, so 2 ** 3 ** 2 groups as 2 ** (3 ** 2),
 // which is 512. That is what "right-associative" means. The loops in term and
 // expr go the other way: they use the left result first, so 8 - 3 - 2 is
 // (8 - 3) - 2. Power is below term, so ** is stronger than * and /.
-static long long power(Parser *p) {
-    long long base = primary(p);
+static Value power(Parser *p) {
+    Value base = primary(p);
     if (p->err) return base;
 
     Token op = peek(p);
@@ -221,62 +319,45 @@ static long long power(Parser *p) {
     p->pos = op.end;
 
     Token rhs = peek(p);                // the exponent starts here
-    long long exponent = power(p);
+    Value exponent = power(p);
     if (p->err) return base;
-
-    // An integer cannot have a negative power. The error is at the START of
-    // the exponent, because the exponent is the thing that is wrong.
-    if (exponent < 0) {
-        fail(p, rhs.start);
-        return base;
-    }
-    return int_power(base, exponent);   // x ** 0 is 1, also 0 ** 0
+    return apply(p, T_POW, base, exponent, op.start, rhs.start);
 }
 
 // term := power { ('*' | '/') power }
 // term sits BETWEEN expr and power. This is why * and / are stronger than
 // + and -: in "3 + 2 * 5" the expr loop asks term for its right side, and term
 // takes "2 * 5" completely before expr can add it to 3.
-static long long term(Parser *p) {
-    long long value = power(p);
+static Value term(Parser *p) {
+    Value v = power(p);
     for (;;) {
-        if (p->err) return value;
+        if (p->err) return v;
         Token op = peek(p);
-        if (op.type != T_STAR && op.type != T_SLASH) return value;
+        if (op.type != T_STAR && op.type != T_SLASH) return v;
         p->pos = op.end;
 
         Token rhs = peek(p);            // the right operand starts here
-        long long right = power(p);
-        if (p->err) return value;
-
-        if (op.type == T_STAR) {
-            value = value * right;
-        } else {
-            // Division by zero is reported at the START of the right operand
-            // (the zero), because the zero is the thing that is wrong.
-            if (right == 0) {
-                fail(p, rhs.start);
-                return value;
-            }
-            value = value / right;      // C truncates toward zero: 7 / 2 is 3
-        }
+        Value r = power(p);
+        if (p->err) return v;
+        v = apply(p, op.type, v, r, op.start, rhs.start);
+        if (p->err) return v;
     }
 }
 
 // expr := term { ('+' | '-') term }
-static long long expr(Parser *p) {
-    long long value = term(p);
+static Value expr(Parser *p) {
+    Value v = term(p);
     for (;;) {
-        if (p->err) return value;
+        if (p->err) return v;
         Token op = peek(p);
-        if (op.type != T_PLUS && op.type != T_MINUS) return value;
+        if (op.type != T_PLUS && op.type != T_MINUS) return v;
         p->pos = op.end;
 
-        long long right = term(p);
-        if (p->err) return value;
-
-        if (op.type == T_PLUS) value = value + right;
-        else value = value - right;
+        Token rhs = peek(p);
+        Value r = term(p);
+        if (p->err) return v;
+        v = apply(p, op.type, v, r, op.start, rhs.start);
+        if (p->err) return v;
     }
 }
 
@@ -303,7 +384,7 @@ static size_t evaluate(Parser *p, Out *out) {
             continue;
         }
 
-        long long value = expr(p);
+        Value value = expr(p);
         if (!p->err) {
             // The expression is finished, so only the end of the line may follow.
             // Anything else is an error, for example "2 3".
@@ -312,8 +393,11 @@ static size_t evaluate(Parser *p, Out *out) {
         }
         if (p->err) return p->err;
 
-        char line[32];
-        int n = snprintf(line, sizeof line, "%lld\n", value);
+        // Integers are printed with %lld, floats with %.15g (so 1.25 * 4 prints
+        // 5 and 0.1 + 0.2 prints 0.3). 64 characters are more than enough.
+        char line[64];
+        int n = value.is_float ? snprintf(line, sizeof line, "%.15g\n", value.d)
+                               : snprintf(line, sizeof line, "%lld\n", value.i);
         out_add(out, line, (size_t)n);
 
         p->pos = peek(p).start;             // now at the '\n' or the end of the file
