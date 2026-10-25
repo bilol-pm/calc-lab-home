@@ -1,7 +1,7 @@
 // Biloliddin Gulomov 251ADB096
 // https://github.com/bilol-pm/calc-lab-home
 // Compile with: gcc -O2 -Wall -Wextra -std=c17 -o calc calc.c -lm
-// Resources used: AI (Claude, claude.ai) - chat link: KEYIN-QOYAMIZ
+// Resources used: AI (Claude, claude.ai) - chat link: https://claude.ai/share/5f3c3b9f-a0b8-4a6a-998f-9a94a94b1513
 
 #include <stdio.h>
 #include <stdlib.h>
